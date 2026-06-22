@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="FCG.Application/FCG.Application.csproj" />
+  <Project Path="FCG.Infrastructure/FCG.Infrastructure.csproj" />
+  <Project Path="FCG.Worker/FCG.Worker.csproj" />
+</Solution>
