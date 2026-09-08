@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using Amazon.Lambda.Core;
 using Amazon.Lambda.SQSEvents;
@@ -12,6 +13,17 @@ namespace FCG.Worker
     public class SqsFunction
     {
         private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+
+        private static readonly ActivitySource ActivitySource = new("FCG.Notificacoes.SqsFunction");
+
+        static SqsFunction()
+        {
+            ActivitySource.AddActivityListener(new ActivityListener
+            {
+                ShouldListenTo = _ => true,
+                Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData
+            });
+        }
 
         private readonly ServiceProvider _serviceProvider;
 
@@ -29,12 +41,14 @@ namespace FCG.Worker
 
             foreach (var record in sqsEvent.Records)
             {
+                using var activity = ActivitySource.StartActivity("notificacoes.usuario-criado");
+
                 try
                 {
                     var evento = JsonSerializer.Deserialize<UserRegisteredEvent>(record.Body, JsonOptions);
                     if (evento is null)
                     {
-                        context.Logger.LogWarning($"[NOTIFICACOES] Evento null — descartando mensagem {record.MessageId}.");
+                        context.Logger.LogWarning($"[NOTIFICACOES] TraceId: {activity?.TraceId} | Evento null — descartando mensagem {record.MessageId}.");
                         continue;
                     }
 
@@ -42,11 +56,11 @@ namespace FCG.Worker
                     var notificacaoService = scope.ServiceProvider.GetRequiredService<INotificacaoService>();
                     await notificacaoService.EnviarBoasVindasAsync(evento);
 
-                    context.Logger.LogInformation($"[NOTIFICACOES] Processado | UsuarioId: {evento.UserId}");
+                    context.Logger.LogInformation($"[NOTIFICACOES] TraceId: {activity?.TraceId} | Processado | UsuarioId: {evento.UserId}");
                 }
                 catch (Exception ex)
                 {
-                    context.Logger.LogError($"[NOTIFICACOES] Falha ao processar mensagem {record.MessageId}: {ex.Message}");
+                    context.Logger.LogError($"[NOTIFICACOES] TraceId: {activity?.TraceId} | Falha ao processar mensagem {record.MessageId}: {ex.Message}");
                     failures.Add(new SQSBatchResponse.BatchItemFailure { ItemIdentifier = record.MessageId });
                 }
             }
@@ -60,12 +74,14 @@ namespace FCG.Worker
 
             foreach (var record in sqsEvent.Records)
             {
+                using var activity = ActivitySource.StartActivity("notificacoes.pagamento-processado");
+
                 try
                 {
                     var evento = JsonSerializer.Deserialize<PaymentProcessedEvent>(record.Body, JsonOptions);
                     if (evento is null)
                     {
-                        context.Logger.LogWarning($"[NOTIFICACOES] Evento null — descartando mensagem {record.MessageId}.");
+                        context.Logger.LogWarning($"[NOTIFICACOES] TraceId: {activity?.TraceId} | Evento null — descartando mensagem {record.MessageId}.");
                         continue;
                     }
 
@@ -74,16 +90,16 @@ namespace FCG.Worker
                         using var scope = _serviceProvider.CreateScope();
                         var notificacaoService = scope.ServiceProvider.GetRequiredService<INotificacaoService>();
                         await notificacaoService.EnviarConfirmacaoCompraAsync(evento);
-                        context.Logger.LogInformation($"[NOTIFICACOES] Confirmação de compra enviada | UserId: {evento.UserId}");
+                        context.Logger.LogInformation($"[NOTIFICACOES] TraceId: {activity?.TraceId} | Confirmação de compra enviada | UserId: {evento.UserId}");
                     }
                     else
                     {
-                        context.Logger.LogInformation($"[NOTIFICACOES] Pagamento rejeitado — sem notificação | UserId: {evento.UserId}");
+                        context.Logger.LogInformation($"[NOTIFICACOES] TraceId: {activity?.TraceId} | Pagamento rejeitado — sem notificação | UserId: {evento.UserId}");
                     }
                 }
                 catch (Exception ex)
                 {
-                    context.Logger.LogError($"[NOTIFICACOES] Falha ao processar mensagem {record.MessageId}: {ex.Message}");
+                    context.Logger.LogError($"[NOTIFICACOES] TraceId: {activity?.TraceId} | Falha ao processar mensagem {record.MessageId}: {ex.Message}");
                     failures.Add(new SQSBatchResponse.BatchItemFailure { ItemIdentifier = record.MessageId });
                 }
             }
