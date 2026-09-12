@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  FCG Notificacoes - funcoes Lambda serverless acionadas diretamente por
+  mensagens SQS (user-created, payment-processed-notificacoes), substituindo
+  o worker RabbitMQ continuo que rodava 24/7. Ver README.md para o fluxo
+  completo e para o setup equivalente usado em desenvolvimento local (LocalStack).
+
+Parameters:
+  NewRelicLicenseKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Chave de licenca (ingest) da New Relic usada pela instrumentacao das
+      funcoes. Deixe em branco para publicar sem telemetria de APM.
+  NewRelicAccountId:
+    Type: String
+    Default: ""
+    Description: Account ID da New Relic (necessario apenas se NewRelicLicenseKey for informado).
+  NewRelicLambdaLayerArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN da Lambda Layer NewRelicDotnet (x86_64) ou NewRelicDotnetARM64 para
+      a regiao/arquitetura de deploy - consulte
+      https://us-east-1.layers.newrelic-external.com/get-layers?CompatibleRuntime=dotnet8
+      (troque a regiao no host da URL conforme necessario). Deixe em branco
+      para publicar sem a layer (as funcoes continuam funcionando normalmente,
+      so sem telemetria completa de APM chegando na New Relic).
+
+Conditions:
+  HasNewRelicLayer: !Not [!Equals [!Ref NewRelicLambdaLayerArn, ""]]
+
+Globals:
+  Function:
+    Runtime: dotnet8
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        CORECLR_ENABLE_PROFILING: "1"
+        CORECLR_PROFILER: "{36032161-FFC0-4B61-B559-F6C5D41BAE5A}"
+        CORECLR_NEWRELIC_HOME: /var/task/newrelic
+        CORECLR_PROFILER_PATH: /var/task/newrelic/libNewRelicProfiler.so
+        NEW_RELIC_LICENSE_KEY: !Ref NewRelicLicenseKey
+        NEW_RELIC_ACCOUNT_ID: !Ref NewRelicAccountId
+
+Resources:
+  UsuarioCriadoDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: user-created-dlq
+
+  UsuarioCriadoQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: user-created
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt UsuarioCriadoDlq.Arn
+        maxReceiveCount: 3
+
+  PagamentoProcessadoDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: payment-processed-notificacoes-dlq
+
+  PagamentoProcessadoQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: payment-processed-notificacoes
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PagamentoProcessadoDlq.Arn
+        maxReceiveCount: 3
+
+  UsuarioCriadoFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: dotnet8
+    Properties:
+      FunctionName: notificacoes-usuario-criado
+      CodeUri: ./FCG.Worker/
+      Handler: "FCG.Worker::FCG.Worker.SqsFunction::UsuarioCriadoHandler"
+      Layers: !If [HasNewRelicLayer, [!Ref NewRelicLambdaLayerArn], !Ref "AWS::NoValue"]
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt UsuarioCriadoQueue.QueueName
+      Events:
+        UsuarioCriadoSqs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt UsuarioCriadoQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  PagamentoProcessadoFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: dotnet8
+    Properties:
+      FunctionName: notificacoes-pagamento-processado
+      CodeUri: ./FCG.Worker/
+      Handler: "FCG.Worker::FCG.Worker.SqsFunction::PagamentoProcessadoHandler"
+      Layers: !If [HasNewRelicLayer, [!Ref NewRelicLambdaLayerArn], !Ref "AWS::NoValue"]
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt PagamentoProcessadoQueue.QueueName
+      Events:
+        PagamentoProcessadoSqs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt PagamentoProcessadoQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+Outputs:
+  UsuarioCriadoFunctionArn:
+    Description: ARN da funcao acionada pela fila user-created
+    Value: !GetAtt UsuarioCriadoFunction.Arn
+  PagamentoProcessadoFunctionArn:
+    Description: ARN da funcao acionada pela fila payment-processed-notificacoes
+    Value: !GetAtt PagamentoProcessadoFunction.Arn
+  UsuarioCriadoQueueUrl:
+    Description: URL da fila user-created
+    Value: !Ref UsuarioCriadoQueue
+  PagamentoProcessadoQueueUrl:
+    Description: URL da fila payment-processed-notificacoes
+    Value: !Ref PagamentoProcessadoQueue
