@@ -1,21 +1,19 @@
-<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk.Worker">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AWSProjectType>Lambda</AWSProjectType>
     <UserSecretsId>dotnet-FCG.Worker-71d3aa47-a47e-44da-b943-1bd7c5879b80</UserSecretsId>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Amazon.Lambda.Core" Version="2.5.0" />
-    <PackageReference Include="Amazon.Lambda.Serialization.SystemTextJson" Version="2.4.4" />
-    <PackageReference Include="Amazon.Lambda.SQSEvents" Version="2.2.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.0" />
     <PackageReference Include="NewRelic.Agent" Version="10.35.0" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\FCG.Application\FCG.Application.csproj" />
+    <ProjectReference Include="..\FCG.Infrastructure\FCG.Infrastructure.csproj" />
   </ItemGroup>
 </Project>

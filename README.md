@@ -1,53 +1,85 @@
 # FCG Notificações
 
-Função serverless (AWS Lambda) responsável pelo envio de notificações por e-mail da plataforma FIAP Cloud Games. Substitui o antigo worker que rodava continuamente consumindo RabbitMQ — agora são duas funções acionadas diretamente por mensagens novas nas filas SQS, sem nenhum processo ocioso 24/7.
+Worker contínuo (.NET 8) responsável pelo envio de notificações por e-mail da plataforma FIAP Cloud Games. Consome eventos do RabbitMQ e roda em container (AKS na Fase 4).
 
-## Responsabilidades
+> A versão Lambda/SQS da Fase 3 está preservada na tag [`fase-3`](https://github.com/caarolinaoliveira/FCG_Notificacoes/tree/fase-3).
 
-- Enviar e-mail de boas-vindas quando um usuário é cadastrado
-- Enviar e-mail de confirmação de compra quando um pagamento é aprovado
+## O que o serviço faz
 
-## Arquitetura
+- Envia e-mail de boas-vindas quando um usuário é cadastrado
+- Envia e-mail de confirmação de compra quando um pagamento é aprovado (pagamentos rejeitados são apenas registrados em log, sem e-mail)
 
-| Fila SQS | Handler | Ação |
-|----------|---------|------|
-| `user-created` | `FCG.Worker::FCG.Worker.SqsFunction::UsuarioCriadoHandler` | Envia e-mail de boas-vindas |
-| `payment-processed-notificacoes` | `FCG.Worker::FCG.Worker.SqsFunction::PagamentoProcessadoHandler` | Envia e-mail de confirmação de compra (só para pagamentos `Approved`) |
+## Filas consumidas
 
-Cada fila tem uma DLQ (`<fila>-dlq`) com `maxReceiveCount: 3` — mensagens que falham 3 vezes vão parar lá em vez de ficar reprocessando pra sempre. O trigger é um **Event Source Mapping** SQS→Lambda nativo da AWS (batch de 5, `ReportBatchItemFailures` para reentrega parcial de lote), não um polling manual.
+| Fila | DLQ | Evento | Ação |
+|------|-----|--------|------|
+| `user.created` | `user.created.dlq` | `UserRegisteredEvent` | Boas-vindas |
+| `payment.processed.notificacoes` | `payment.processed.notificacoes.dlq` | `PaymentProcessedEvent` | Confirmação de compra (só `Status == "Approved"`) |
 
-O código da função está em [`FCG.Worker/SqsFunction.cs`](FCG.Worker/SqsFunction.cs); a lógica de negócio (o que cada e-mail faz) está em [`FCG.Application/Services/NotificationService.cs`](FCG.Application/Services/NotificationService.cs).
-
-## Infraestrutura como código
-
-O template SAM em [`template.yaml`](template.yaml) declara as duas funções, as filas SQS + DLQs e os Event Source Mappings — é a fonte de verdade da infraestrutura desta função, versionada neste repositório (não no de orquestração).
-
-### Deploy em AWS real
-
-```bash
-sam build
-sam deploy --guided
-```
-
-No modo guiado, informe `NewRelicLicenseKey`/`NewRelicAccountId` (opcional, para telemetria de APM) e `NewRelicLambdaLayerArn` (ARN da layer `NewRelicDotnet`/`NewRelicDotnetARM64` da sua região — consulte `https://<região>.layers.newrelic-external.com/get-layers?CompatibleRuntime=dotnet8`). Deixe os três em branco para publicar sem instrumentação de APM.
-
-### Desenvolvimento local (LocalStack)
-
-Para rodar localmente como parte do ambiente completo (`FCG_Orquestracao/docker-compose.yaml`), o LocalStack registra as mesmas duas funções via `localstack-init/00-setup-notificacoes.sh` a partir de um zip publicado manualmente (LocalStack Community não builda projetos .NET via `sam build`):
-
-```bash
-./package-lambda.ps1
-```
-
-Gera `../FCG_Orquestracao/localstack-init/artifacts/notificacoes.zip`; suba/reinicie o LocalStack (`docker compose restart localstack` no repo de orquestração) para registrar as funções e os Event Source Mappings a partir dele. Esse caminho é só para dev local — o `template.yaml` é a IaC de verdade para deploy em AWS.
+As filas e a DLQ (via exchange `dlx`) são declaradas pelo próprio worker na inicialização.
 
 ## Resiliência
 
-- Retry automático via Event Source Mapping + DLQ (`maxReceiveCount: 3`)
-- `ReportBatchItemFailures` — mensagens com falha num lote não derrubam o lote inteiro, só são reentregues individualmente
+- **Retry:** falha ao processar reenfileira a mensagem com backoff exponencial (2s, 4s), contador no header `x-retry-count`
+- **DLQ:** após 3 tentativas, mensagem malformada (JSON inválido ou `null`) ou circuit breaker aberto, a mensagem vai para a DLQ
+- **Circuit breaker (Polly):** abre após 3 falhas consecutivas por 30s; enquanto aberto, as mensagens são devolvidas à fila
+- **Ack manual** e `prefetch = 1`
 
 ## Observabilidade
 
-Instrumentado com o agente .NET da New Relic (profiler + Lambda Layer). Ver [`FCG_Orquestracao/README.md`](../FCG_Orquestracao/README.md) para a documentação completa da stack de observabilidade do sistema.
+- Logs estruturados (`ILogger<T>`) com prefixo `[NOTIFICACOES]` e `TraceId` gerado via `ActivitySource` (`FCG.Notificacoes.Worker`)
+- Agente New Relic .NET instalado na imagem Docker (app name `FCG-NotificacoesWorker`)
 
-> ⚠️ As credenciais/ARNs de exemplo neste repositório e no `localstack-init` são exclusivos para ambiente de desenvolvimento local. Não utilize em produção.
+## Variáveis de ambiente
+
+| Variável | Obrigatória | Padrão | Descrição |
+|----------|-------------|--------|-----------|
+| `RabbitMQ__Host` | não | `localhost` | Host do RabbitMQ |
+| `RabbitMQ__Port` | não | `5672` | Porta AMQP |
+| `RabbitMQ__Usuario` | **sim** | — | Usuário do RabbitMQ |
+| `RabbitMQ__Senha` | **sim** | — | Senha do RabbitMQ |
+| `NEW_RELIC_LICENSE_KEY` | em produção | — | Chave de licença da New Relic (injetada em runtime; nunca vai na imagem) |
+
+**Não há credenciais no código nem no repositório.** Se `RabbitMQ__Usuario` ou `RabbitMQ__Senha` não forem informados, o worker registra um erro claro e encerra com exit code 1 na inicialização.
+
+## Como rodar local
+
+Requisitos: .NET 8 SDK (ou superior com o runtime 8) e um RabbitMQ acessível.
+
+```bash
+# RabbitMQ local (defina o usuário/senha que quiser)
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 \
+  -e RABBITMQ_DEFAULT_USER=<usuario> -e RABBITMQ_DEFAULT_PASS=<senha> \
+  rabbitmq:3-management
+
+# Credenciais via user-secrets (o projeto já tem UserSecretsId)
+dotnet user-secrets set "RabbitMQ:Usuario" "<usuario>" --project FCG.Worker
+dotnet user-secrets set "RabbitMQ:Senha"   "<senha>"   --project FCG.Worker
+
+dotnet run --project FCG.Worker
+```
+
+Alternativa sem user-secrets: exporte `RabbitMQ__Usuario` e `RabbitMQ__Senha` no ambiente antes do `dotnet run`.
+
+## Como rodar em container
+
+```bash
+docker build -t fcg-notificacoes .
+
+docker run --rm \
+  -e RabbitMQ__Host=<host-do-rabbitmq> \
+  -e RabbitMQ__Usuario=<usuario> \
+  -e RabbitMQ__Senha=<senha> \
+  -e NEW_RELIC_LICENSE_KEY=<license-key> \
+  fcg-notificacoes
+```
+
+A imagem é multi-stage (`sdk:8.0` para build, `runtime:8.0` na final, sem ASP.NET porque o worker não expõe HTTP) e é **linux/amd64** (x64), compatível com os nós do AKS. No Kubernetes, `RabbitMQ__Usuario`, `RabbitMQ__Senha` e `NEW_RELIC_LICENSE_KEY` devem vir de um `Secret`.
+
+## Estrutura
+
+```
+FCG.Application/     Eventos e INotificacaoService/NotificacaoService (lógica do e-mail)
+FCG.Infrastructure/  Consumers RabbitMQ (BackgroundService), retry, circuit breaker e DLQ
+FCG.Worker/          Host (Program.cs): conexão RabbitMQ, policy Polly e DI
+```
