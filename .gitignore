@@ -10,6 +10,3 @@ obj/
 .vs/
 .vscode/
 *.user
-
-.aws-sam/
-samconfig.toml
