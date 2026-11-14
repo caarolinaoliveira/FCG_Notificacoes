@@ -111,10 +111,71 @@ jobs:
       - name: Push da imagem
         run: docker push "$IMAGE_NAME:$IMAGE_TAG"
 
-  # TODO: este job entra quando o AKS existir.
   deploy:
-    if: false
     needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AKS_SUBSCRIPTION: 65ba14a1-692b-4512-8cb5-f33c5cea5970
+      AKS_RESOURCE_GROUP: rg-fcg-aks
+      AKS_CLUSTER: aks-fcg
+      K8S_NAMESPACE: fcg
+      # Deployment e container têm o mesmo nome em FCG_Orquestracao/k8s/base/apps/notificacoes-worker.yaml.
+      DEPLOYMENT: notificacoes-worker
+      CONTAINER: notificacoes-worker
     steps:
-      - run: echo "Deploy no AKS ainda não implementado."
+      - uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verificar o estado do cluster
+        id: cluster
+        run: |
+          estado=$(az aks show --subscription "$AKS_SUBSCRIPTION" --resource-group "$AKS_RESOURCE_GROUP" --name "$AKS_CLUSTER" --query powerState.code --output tsv)
+          echo "Estado do cluster: $estado"
+          if [ "$estado" = "Running" ]; then
+            echo "running=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "running=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::A imagem $IMAGE_NAME:$IMAGE_TAG foi publicada, mas o cluster $AKS_CLUSTER está com estado '$estado'; o deploy foi ignorado."
+            echo "Imagem publicada, deploy ignorado: cluster $AKS_CLUSTER em '$estado'." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # O runner já traz kubectl e kubelogin; só instala (versões fixas) se algum faltar.
+      - name: Garantir kubectl e kubelogin
+        if: steps.cluster.outputs.running == 'true'
+        run: |
+          if ! command -v kubectl >/dev/null || ! command -v kubelogin >/dev/null; then
+            sudo az aks install-cli --client-version v1.31.0 --kubelogin-version v0.1.4
+          fi
+          kubectl version --client
+
+      - name: Credenciais do cluster (usuário)
+        if: steps.cluster.outputs.running == 'true'
+        run: |
+          az aks get-credentials --subscription "$AKS_SUBSCRIPTION" --resource-group "$AKS_RESOURCE_GROUP" --name "$AKS_CLUSTER" --overwrite-existing
+          # Cluster com Entra ID: o kubeconfig passa a usar o token do az login.
+          if grep -q kubelogin ~/.kube/config; then kubelogin convert-kubeconfig -l azurecli; fi
+
+      - name: Atualizar a imagem do deployment
+        if: steps.cluster.outputs.running == 'true'
+        run: kubectl -n "$K8S_NAMESPACE" set image "deployment/$DEPLOYMENT" "$CONTAINER=$IMAGE_NAME:$IMAGE_TAG"
+
+      - name: Aguardar o rollout
+        if: steps.cluster.outputs.running == 'true'
+        run: kubectl -n "$K8S_NAMESPACE" rollout status "deployment/$DEPLOYMENT" --timeout=5m
+
+      - name: Resumo
+        if: steps.cluster.outputs.running == 'true'
+        run: |
+          {
+            echo "### Deploy no AKS"
+            echo "- Imagem implantada: \`$IMAGE_NAME:$IMAGE_TAG\`"
+            echo "- Deployment: \`$K8S_NAMESPACE/$DEPLOYMENT\` no cluster \`$AKS_CLUSTER\`"
+          } >> "$GITHUB_STEP_SUMMARY"
